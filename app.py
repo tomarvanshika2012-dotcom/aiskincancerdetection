@@ -152,4 +152,4 @@ fig, ax = plt.subplots()
 sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", ax=ax)
 ax.set_xlabel("Predicted")
 ax.set_ylabel("Actual")
-st.sidebar.pyplot(fig)
+st.sidebar.pyplot(fig)python -m pip install --upgrade pip

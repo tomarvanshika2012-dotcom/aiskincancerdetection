@@ -1,9 +1,9 @@
-streamlit==1.31.1
-torch==2.2.2
-torchvision==0.17.2
+streamlit
+torch
+torchvision
 pillow
-numpy==1.26.4
-matplotlib==3.8.2
-scikit-learn==1.4.1.post1
-opencv-python-headless==4.9.0.80
-seaborn==0.13.2
+numpy
+matplotlib
+scikit-learn
+opencv-python-headless
+seaborn
