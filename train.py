@@ -7,12 +7,12 @@ from sklearn.model_selection import train_test_split
 from sklearn.utils import class_weight
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
 from tensorflow.keras.applications import ResNet50
-from tensorflow.keras.layers import Dense, GlobalAveragePooling2D, Dropout
+from tensorflow.keras.layers import Dense, GlobalAveragePooling2D, Dropout, Input
 from tensorflow.keras.models import Model
-from tensorflow.keras.callbacks import EarlyStopping
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
 
 # =========================
-# PATH SETUP (FIXED)
+# PATH SETUP
 # =========================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "archive")
@@ -73,7 +73,7 @@ val_df, test_df = train_test_split(
 )
 
 # =========================
-# DATA GENERATORS (Improved Augmentation)
+# DATA GENERATORS
 # =========================
 IMG_SIZE = (224, 224)
 BATCH_SIZE = 32
@@ -98,6 +98,7 @@ train_gen = train_datagen.flow_from_dataframe(
     target_size=IMG_SIZE,
     batch_size=BATCH_SIZE,
     class_mode="binary",
+    shuffle=True
 )
 
 val_gen = val_test_datagen.flow_from_dataframe(
@@ -107,6 +108,7 @@ val_gen = val_test_datagen.flow_from_dataframe(
     target_size=IMG_SIZE,
     batch_size=BATCH_SIZE,
     class_mode="binary",
+    shuffle=False
 )
 
 test_gen = val_test_datagen.flow_from_dataframe(
@@ -116,10 +118,11 @@ test_gen = val_test_datagen.flow_from_dataframe(
     target_size=IMG_SIZE,
     batch_size=BATCH_SIZE,
     class_mode="binary",
+    shuffle=False
 )
 
 # =========================
-# COMPUTE CLASS WEIGHTS
+# CLASS WEIGHTS
 # =========================
 class_weights = class_weight.compute_class_weight(
     class_weight="balanced",
@@ -131,41 +134,55 @@ class_weights_dict = dict(enumerate(class_weights))
 print("Class Weights:", class_weights_dict)
 
 # =========================
-# MODEL BUILDING (Fine-Tuning Enabled)
+# MODEL BUILDING
 # =========================
 print("Building model...")
+
+inputs = Input(shape=(224, 224, 3))
 
 base_model = ResNet50(
     weights="imagenet",
     include_top=False,
-    input_shape=(224, 224, 3),
+    input_tensor=inputs
 )
 
-# Fine-tune last 30 layers
 base_model.trainable = True
+
 for layer in base_model.layers[:-30]:
     layer.trainable = False
 
 x = GlobalAveragePooling2D()(base_model.output)
 x = Dense(256, activation="relu")(x)
 x = Dropout(0.5)(x)
-output = Dense(1, activation="sigmoid")(x)
+outputs = Dense(1, activation="sigmoid")(x)
 
-model = Model(inputs=base_model.input, outputs=output)
+model = Model(inputs=inputs, outputs=outputs)
+
+# 🔥 M1/M2 Mac Optimizer Fix
+optimizer = tf.keras.optimizers.legacy.Adam(learning_rate=1e-5)
 
 model.compile(
-    optimizer=tf.keras.optimizers.Adam(learning_rate=1e-5),
+    optimizer=optimizer,
     loss="binary_crossentropy",
-    metrics=["accuracy", tf.keras.metrics.AUC(name="auc")],
+    metrics=["accuracy", tf.keras.metrics.AUC(name="auc")]
 )
 
+model.summary()
+
 # =========================
-# EARLY STOPPING
+# CALLBACKS
 # =========================
 early_stop = EarlyStopping(
     monitor="val_loss",
     patience=3,
     restore_best_weights=True
+)
+
+checkpoint = ModelCheckpoint(
+    "best_model.h5",
+    monitor="val_loss",
+    save_best_only=True,
+    save_weights_only=False
 )
 
 # =========================
@@ -178,20 +195,21 @@ history = model.fit(
     epochs=20,
     validation_data=val_gen,
     class_weight=class_weights_dict,
-    callbacks=[early_stop]
+    callbacks=[early_stop, checkpoint]
 )
 
 # =========================
 # EVALUATION
 # =========================
 loss, accuracy, auc = model.evaluate(test_gen)
+
 print("Test Accuracy:", accuracy)
 print("Test AUC:", auc)
 
 # =========================
-# SAVE MODEL
+# SAVE FINAL MODEL
 # =========================
-MODEL_PATH = os.path.join(BASE_DIR, "skin_cancer_model.h5")
-model.save(MODEL_PATH)
+FINAL_MODEL_PATH = os.path.join(BASE_DIR, "skin_cancer_model.h5")
+model.save(FINAL_MODEL_PATH, save_format="h5")
 
-print(f"Model saved successfully at: {MODEL_PATH}")
+print(f"Model saved successfully at: {FINAL_MODEL_PATH}")
