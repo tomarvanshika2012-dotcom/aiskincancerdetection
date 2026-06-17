@@ -28,6 +28,15 @@ from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib import colors
 from reportlab.lib.units import inch
 import requests
+from security import (
+    init_security_tables, check_session_timeout, perform_session_logout,
+    update_activity, log_activity, track_login_attempt, is_account_locked,
+    store_otp, verify_otp, validate_upload, strip_image_metadata,
+    sanitize_input, sanitize_html, validate_email,
+    show_medical_disclaimer, show_privacy_policy,
+    render_security_dashboard, get_audit_logs,
+    MAX_LOGIN_ATTEMPTS, LOCKOUT_DURATION_MINUTES
+)
 
 # ================= PAGE CONFIG =================
 st.set_page_config(page_title="AI Skin Cancer Detection", page_icon="🧬", layout="wide")
@@ -609,6 +618,7 @@ def get_all_scans():
     return df
 
 init_db()
+init_security_tables()
 
 
 # ================= SESSION STATE =================
@@ -746,6 +756,14 @@ selected_lang = st.sidebar.selectbox(
     index=list(SUPPORTED_LANGUAGES.keys()).index(st.session_state.selected_language)
 )
 st.session_state.selected_language = selected_lang
+
+# ── Session Timeout Check ──
+if check_session_timeout():
+    perform_session_logout()
+    st.warning("⏰ Your session has expired due to inactivity. Please log in again.")
+    st.rerun()
+if st.session_state.get("logged_in", False):
+    update_activity()
 
 if theme_mode == "Dark":
     st.markdown("<style>.stApp {background-color: #0E1117; color: white;}</style>", unsafe_allow_html=True)
@@ -2093,42 +2111,111 @@ if page == "🏠 Home":
                             padding: 30px; border-radius: 20px; border: 1px solid #667eea33;'>
                 """, unsafe_allow_html=True)
 
-                login_role = st.radio("I am a:", ["Patient", "Doctor / Admin"], horizontal=True, key="home_login_role")
-                login_email = st.text_input("📧 Email Address", key="home_login_email", placeholder="your@email.com")
-                login_pass = st.text_input("🔒 Password", type="password", key="home_login_pass", placeholder="Enter password")
+                # ── OTP Verification Step ──
+                if st.session_state.get("_otp_pending", False):
+                    st.info(f"📧 A 6-digit OTP has been sent to **{st.session_state.get('_otp_email', '')}**")
+                    st.markdown("""
+                    <div style='background: #e8f5e9; padding: 12px 16px; border-radius: 8px;
+                                border-left: 4px solid #4caf50; margin: 10px 0; color: #2e7d32;'>
+                        <strong>🔐 Your OTP Code:</strong> <code style='font-size: 20px; letter-spacing: 4px;'>""" +
+                        st.session_state.get("_otp_code", "") + """</code>
+                        <br><small>In production, this would be sent via email/SMS.</small>
+                    </div>
+                    """, unsafe_allow_html=True)
 
-                if st.button("🔑 Login", use_container_width=True, key="home_login_btn", type="primary"):
-                    if login_email and login_pass:
-                        if login_role == "Patient":
-                            user, err = login_patient(login_email, login_pass)
-                            if user:
+                    otp_input = st.text_input("Enter 6-digit OTP", key="otp_input_field",
+                                              max_chars=6, placeholder="000000")
+                    bc1, bc2 = st.columns(2)
+                    with bc1:
+                        if st.button("✅ Verify OTP", use_container_width=True, key="verify_otp_btn", type="primary"):
+                            success, msg = verify_otp(st.session_state["_otp_email"], otp_input)
+                            if success:
+                                # Complete login
+                                user_data = st.session_state["_otp_user_data"]
+                                user_role = st.session_state["_otp_user_role"]
+                                role_table = "patients" if user_role == "patient" else "doctors"
+                                track_login_attempt(st.session_state["_otp_email"], True, role_table)
+
+                                user_id = user_data.get("patient_id", user_data.get("doctor_id", ""))
+                                log_activity(user_id, user_role, "LOGIN_SUCCESS",
+                                           f"Logged in via OTP 2FA")
+
                                 st.session_state.logged_in = True
-                                st.session_state.user_role = "patient"
-                                st.session_state.user_data = user
-                                st.toast(f"Welcome back, {user['full_name']}!", icon="👋")
+                                st.session_state.user_role = user_role
+                                st.session_state.user_data = user_data
+                                st.session_state["_otp_verified"] = True
+                                # Clean up OTP state
+                                for k in ["_otp_pending", "_otp_code", "_otp_email",
+                                          "_otp_user_data", "_otp_user_role"]:
+                                    if k in st.session_state:
+                                        del st.session_state[k]
+                                update_activity()
+                                st.toast(f"Welcome, {user_data.get('full_name', 'User')}!", icon="👋")
                                 st.rerun()
                             else:
-                                st.error(f"❌ {err}")
-                        else:
-                            user, err = login_doctor(login_email, login_pass)
-                            if user:
-                                st.session_state.logged_in = True
-                                if user.get("specialization") == "System Administrator":
-                                    st.session_state.user_role = "admin"
+                                st.error(f"❌ {msg}")
+                    with bc2:
+                        if st.button("🔄 Cancel", use_container_width=True, key="cancel_otp_btn"):
+                            for k in ["_otp_pending", "_otp_code", "_otp_email",
+                                      "_otp_user_data", "_otp_user_role"]:
+                                if k in st.session_state:
+                                    del st.session_state[k]
+                            st.rerun()
+
+                else:
+                    # ── Step 1: Email + Password ──
+                    login_role = st.radio("I am a:", ["Patient", "Doctor / Admin"], horizontal=True, key="home_login_role")
+                    login_email = st.text_input("📧 Email Address", key="home_login_email", placeholder="your@email.com")
+                    login_pass = st.text_input("🔒 Password", type="password", key="home_login_pass", placeholder="Enter password")
+
+                    if st.button("🔑 Login", use_container_width=True, key="home_login_btn", type="primary"):
+                        if login_email and login_pass:
+                            role_table = "patients" if login_role == "Patient" else "doctors"
+
+                            # Check account lockout
+                            locked, remaining = is_account_locked(login_email, role_table)
+                            if locked:
+                                st.error(f"🔒 Account locked due to too many failed attempts. Try again in **{remaining:.0f} minutes**.")
+                                log_activity("", "", "LOGIN_LOCKED", f"Locked account login attempt: {login_email}")
+                            else:
+                                if login_role == "Patient":
+                                    user, err = login_patient(login_email, login_pass)
+                                    user_role = "patient"
                                 else:
-                                    st.session_state.user_role = "doctor"
-                                st.session_state.user_data = user
-                                st.toast(f"Welcome, Dr. {user['full_name']}!", icon="👨‍⚕️")
-                                st.rerun()
-                            else:
-                                st.error(f"❌ {err}")
-                    else:
-                        st.warning("Please fill in all fields.")
+                                    user, err = login_doctor(login_email, login_pass)
+                                    if user and user.get("specialization") == "System Administrator":
+                                        user_role = "admin"
+                                    else:
+                                        user_role = "doctor"
+
+                                if user:
+                                    # Password correct → send OTP
+                                    otp = store_otp(login_email)
+                                    st.session_state["_otp_pending"] = True
+                                    st.session_state["_otp_code"] = otp
+                                    st.session_state["_otp_email"] = login_email
+                                    st.session_state["_otp_user_data"] = user
+                                    st.session_state["_otp_user_role"] = user_role
+                                    log_activity(user.get("patient_id", user.get("doctor_id", "")),
+                                               user_role, "OTP_SENT", f"OTP sent to {login_email}")
+                                    st.rerun()
+                                else:
+                                    # Failed login
+                                    track_login_attempt(login_email, False, role_table)
+                                    log_activity("", "", "LOGIN_FAILED", f"Failed login: {login_email}")
+                                    # Show remaining attempts
+                                    locked_now, _ = is_account_locked(login_email, role_table)
+                                    if locked_now:
+                                        st.error(f"🔒 Account locked after {MAX_LOGIN_ATTEMPTS} failed attempts. Wait {LOCKOUT_DURATION_MINUTES} minutes.")
+                                    else:
+                                        st.error(f"❌ {err}")
+                        else:
+                            st.warning("Please fill in all fields.")
 
                 st.markdown("</div>", unsafe_allow_html=True)
 
             st.markdown("---")
-            st.caption("🔓 Admin login available for authorized personnel only.")
+            st.caption("🔓 Admin login available for authorized personnel only. | 🔒 Accounts lock after 5 failed attempts.")
 
         else:  # Register
             st.markdown("""
