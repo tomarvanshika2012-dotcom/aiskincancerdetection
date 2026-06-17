@@ -213,6 +213,14 @@ def init_db():
             FOREIGN KEY (doctor_id) REFERENCES doctors(doctor_id)
         )
     """)
+    # ── Appointments table migration (new columns) ──
+    for col, ctype in [("patient_name","TEXT"),("patient_age","INTEGER"),("patient_gender","TEXT"),
+                       ("patient_phone","TEXT"),("patient_email","TEXT"),
+                       ("symptoms","TEXT"),("medical_history","TEXT"),("skin_image","BLOB")]:
+        try:
+            c.execute(f"ALTER TABLE appointments ADD COLUMN {col} {ctype}")
+        except Exception:
+            pass
 
     # ── Reports table ──
     c.execute("""
@@ -458,14 +466,21 @@ def get_all_patients_list():
     return df
 
 # ── Appointment CRUD ──
-def create_appointment(patient_id, doctor_id, date, time, consultation_type="Online", notes=""):
+def create_appointment(patient_id, doctor_id, date, time, consultation_type="Online", notes="",
+                      patient_name="", patient_age=None, patient_gender="",
+                      patient_phone="", patient_email="",
+                      symptoms="", medical_history="", skin_image_blob=None):
     conn = sqlite3.connect(DB_PATH)
     aid = generate_id("APT")
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     conn.execute("""INSERT INTO appointments
-        (appointment_id, patient_id, doctor_id, date, time, status, consultation_type, notes, created_at)
-        VALUES (?,?,?,?,?,?,?,?,?)""",
-        (aid, patient_id, doctor_id, date, time, "Pending", consultation_type, notes, now))
+        (appointment_id, patient_id, doctor_id, date, time, status, consultation_type, notes, created_at,
+         patient_name, patient_age, patient_gender, patient_phone, patient_email,
+         symptoms, medical_history, skin_image)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (aid, patient_id, doctor_id, date, time, "Pending", consultation_type, notes, now,
+         patient_name, patient_age, patient_gender, patient_phone, patient_email,
+         symptoms, medical_history, skin_image_blob))
     conn.commit()
     conn.close()
     return aid
@@ -480,10 +495,15 @@ def get_appointments_for_patient(patient_id):
 
 def get_appointments_for_doctor(doctor_id):
     conn = sqlite3.connect(DB_PATH)
-    df = pd.read_sql_query("""SELECT a.*, p.full_name as patient_name, p.age, p.gender, p.phone_number as patient_phone
+    df = pd.read_sql_query("""SELECT a.*, p.full_name as p_full_name, p.age as p_age, p.gender as p_gender, p.phone_number as p_phone
         FROM appointments a LEFT JOIN patients p ON a.patient_id = p.patient_id
         WHERE a.doctor_id=? ORDER BY a.date DESC, a.time DESC""", conn, params=(doctor_id,))
     conn.close()
+    # Use appointment-level patient info if available, else fall back to patients table
+    if 'patient_name' not in df.columns:
+        df['patient_name'] = df.get('p_full_name', '')
+    else:
+        df['patient_name'] = df['patient_name'].fillna(df.get('p_full_name', ''))
     return df
 
 def update_appointment_status(appointment_id, status):
@@ -898,21 +918,58 @@ def find_similar_cases(feature_vector, top_k=3):
 @st.cache_resource
 def load_local_model():
     import os
+    import time as _time
     model_dir = "/tmp/models"
     os.makedirs(model_dir, exist_ok=True)
     
     MODEL_URL = "https://huggingface.co/vanshikatomar/Skin-Cancer-model/resolve/main/skin_cancer_model_v7_best.h5"
     MODEL_PATH = os.path.join(model_dir, "skin_cancer_model_v7_best.h5")
     
-    # Download if not exists (Render cache)
+    # Download if not exists (Render cache) — with retry logic
     if not os.path.exists(MODEL_PATH):
-        with st.spinner("🚀 Downloading model (~200MB, one-time)..."):
-            response = requests.get(MODEL_URL, timeout=300, stream=True)
-            response.raise_for_status()
-            with open(MODEL_PATH, "wb") as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    f.write(chunk)
-        st.success("✅ Model downloaded!")
+        max_retries = 3
+        for attempt in range(1, max_retries + 1):
+            try:
+                with st.spinner(f"🚀 Downloading model (~200MB, attempt {attempt}/{max_retries})..."):
+                    response = requests.get(
+                        MODEL_URL,
+                        timeout=(30, 120),   # (connect timeout, read timeout)
+                        stream=True,
+                    )
+                    response.raise_for_status()
+                    total_size = int(response.headers.get("content-length", 0))
+                    downloaded = 0
+                    with open(MODEL_PATH + ".tmp", "wb") as f:
+                        for chunk in response.iter_content(chunk_size=65536):
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                    # Verify download completeness
+                    if total_size and downloaded < total_size:
+                        raise ConnectionError(
+                            f"Incomplete download: got {downloaded}/{total_size} bytes"
+                        )
+                    os.rename(MODEL_PATH + ".tmp", MODEL_PATH)
+                st.success("✅ Model downloaded!")
+                break  # success — exit retry loop
+            except (requests.exceptions.ConnectionError,
+                    requests.exceptions.Timeout,
+                    ConnectionError) as e:
+                # Clean up partial file
+                if os.path.exists(MODEL_PATH + ".tmp"):
+                    os.remove(MODEL_PATH + ".tmp")
+                if attempt < max_retries:
+                    wait = 5 * attempt
+                    st.warning(
+                        f"⚠️ Download attempt {attempt} failed: {e}. "
+                        f"Retrying in {wait}s…"
+                    )
+                    _time.sleep(wait)
+                else:
+                    st.error(
+                        "❌ Model download failed after 3 attempts. "
+                        "Please check your internet connection and try again."
+                    )
+                    return None
     
     try:
         return tf.keras.models.load_model(MODEL_PATH, compile=False)
@@ -3764,49 +3821,172 @@ if page == "📅 Appointments":
     st.markdown("## 📅 Appointments")
 
     if role == "patient":
-        # Book New Appointment
-        st.markdown("### 📌 Book New Appointment")
+        # ──────────────────────────────────────────────────
+        #  BOOK NEW APPOINTMENT — Enhanced Form
+        # ──────────────────────────────────────────────────
+        st.markdown("""
+        <div style='background: linear-gradient(135deg, #667eea22, #764ba222);
+                    padding: 20px 25px; border-radius: 14px; margin-bottom: 20px;
+                    border-left: 5px solid #667eea;'>
+            <h3 style='margin: 0; color: #667eea;'>📌 Book Appointment</h3>
+            <p style='margin: 5px 0 0 0; color: #888; font-size: 13px;'>Fill in the details below to schedule your consultation</p>
+        </div>
+        """, unsafe_allow_html=True)
+
         doctors_df = get_all_doctors(verified_only=True)
 
         if len(doctors_df) > 0:
-            doc_options = {}
-            for _, doc in doctors_df.iterrows():
-                label = f"Dr. {doc['full_name']} — {doc.get('specialization', 'N/A')} | ⭐ {doc.get('average_rating', 0):.1f} | ₹{doc.get('consultation_fee', 0):.0f}"
-                doc_options[label] = doc["doctor_id"]
+            with st.form("book_appointment", clear_on_submit=False):
 
-            selected_doc_label = st.selectbox("Select Doctor", list(doc_options.keys()))
-            selected_doc_id = doc_options[selected_doc_label]
-
-            # Show doctor details
-            doc_info = get_doctor(selected_doc_id)
-            if doc_info:
-                st.markdown(f"""
-                <div style='background: linear-gradient(135deg, #20c99711, #339af022);
-                            padding: 15px; border-radius: 10px; border-left: 4px solid #20c997; margin: 10px 0;'>
-                    <h4 style='margin: 0;'>👨‍⚕️ Dr. {doc_info.get('full_name', 'N/A')}</h4>
-                    <p style='margin: 5px 0; color: #888;'>{doc_info.get('specialization', 'N/A')} • {doc_info.get('qualification', 'N/A')} • {doc_info.get('years_of_experience', 0)} yrs exp</p>
-                    <p style='margin: 5px 0;'>🏥 {doc_info.get('hospital_or_clinic_name', 'N/A') or 'Not set'} &nbsp;|&nbsp; 📍 {doc_info.get('city', 'N/A') or 'Not set'}</p>
-                    <p style='margin: 5px 0;'>📅 Available: {doc_info.get('available_days', 'N/A')} &nbsp;|&nbsp; ⏰ {doc_info.get('available_time_slots', 'N/A')}</p>
-                    <p style='margin: 5px 0;'>💰 Fee: ₹{doc_info.get('consultation_fee', 0):.0f} &nbsp;|&nbsp; 🖥️ Mode: {doc_info.get('consultation_mode', 'N/A')}</p>
+                # ━━━━ SECTION 1: Patient Details ━━━━
+                st.markdown("""
+                <div style='background: linear-gradient(135deg, #e8f5e922, #c8e6c922);
+                            padding: 12px 18px; border-radius: 10px; margin: 10px 0 15px 0;
+                            border-left: 4px solid #4caf50;'>
+                    <h4 style='margin: 0;'>👤 Patient Details</h4>
                 </div>
                 """, unsafe_allow_html=True)
 
-            with st.form("book_appointment"):
+                pd1, pd2, pd3 = st.columns(3)
+                with pd1:
+                    apt_full_name = st.text_input("Full Name *", value=user.get("full_name", ""), key="apt_fname")
+                with pd2:
+                    apt_age = st.number_input("Age *", min_value=1, max_value=120,
+                                              value=int(user.get("age", 25)) if user.get("age") else 25,
+                                              key="apt_age")
+                with pd3:
+                    gender_options = ["Male", "Female", "Other"]
+                    default_gender_idx = 0
+                    ug = (user.get("gender") or "").capitalize()
+                    if ug in gender_options:
+                        default_gender_idx = gender_options.index(ug)
+                    apt_gender = st.selectbox("Gender *", gender_options, index=default_gender_idx, key="apt_gender")
+
+                pd4, pd5 = st.columns(2)
+                with pd4:
+                    apt_phone = st.text_input("Mobile Number", value=user.get("phone_number", "") or "",
+                                              placeholder="e.g. +91 9876543210", key="apt_phone")
+                with pd5:
+                    apt_email = st.text_input("Email Address", value=user.get("email", "") or "",
+                                              placeholder="email@example.com", key="apt_email")
+
+                st.markdown("<div style='height: 8px;'></div>", unsafe_allow_html=True)
+
+                # ━━━━ SECTION 2: Appointment Details ━━━━
+                st.markdown("""
+                <div style='background: linear-gradient(135deg, #e3f2fd22, #bbdefb22);
+                            padding: 12px 18px; border-radius: 10px; margin: 10px 0 15px 0;
+                            border-left: 4px solid #2196f3;'>
+                    <h4 style='margin: 0;'>📋 Appointment Details</h4>
+                </div>
+                """, unsafe_allow_html=True)
+
+                # Doctor selection
+                doc_options = {}
+                for _, doc in doctors_df.iterrows():
+                    label = f"Dr. {doc['full_name']} — {doc.get('specialization', 'N/A')} | ⭐ {doc.get('average_rating', 0):.1f} | ₹{doc.get('consultation_fee', 0):.0f}"
+                    doc_options[label] = doc["doctor_id"]
+
+                selected_doc_label = st.selectbox("Select Doctor *", list(doc_options.keys()), key="apt_doc_select")
+                selected_doc_id = doc_options[selected_doc_label]
+
+                # Show selected doctor info card
+                doc_info = get_doctor(selected_doc_id)
+                if doc_info:
+                    st.markdown(f"""
+                    <div style='background: linear-gradient(135deg, #20c99711, #339af022);
+                                padding: 15px; border-radius: 10px; border-left: 4px solid #20c997; margin: 5px 0 15px 0;'>
+                        <h4 style='margin: 0;'>👨‍⚕️ Dr. {doc_info.get('full_name', 'N/A')}</h4>
+                        <p style='margin: 5px 0; color: #888;'>{doc_info.get('specialization', 'N/A')} • {doc_info.get('qualification', 'N/A')} • {doc_info.get('years_of_experience', 0)} yrs exp</p>
+                        <p style='margin: 5px 0;'>🏥 {doc_info.get('hospital_or_clinic_name', 'N/A') or 'Not set'} &nbsp;|&nbsp; 📍 {doc_info.get('city', 'N/A') or 'Not set'}</p>
+                        <p style='margin: 5px 0;'>📅 Available: {doc_info.get('available_days', 'N/A')} &nbsp;|&nbsp; ⏰ {doc_info.get('available_time_slots', 'N/A')}</p>
+                        <p style='margin: 5px 0;'>💰 Fee: ₹{doc_info.get('consultation_fee', 0):.0f} &nbsp;|&nbsp; 🖥️ Mode: {doc_info.get('consultation_mode', 'N/A')}</p>
+                    </div>
+                    """, unsafe_allow_html=True)
+
                 ac1, ac2, ac3 = st.columns(3)
                 with ac1:
-                    apt_date = st.date_input("Appointment Date")
+                    apt_date = st.date_input("Select Date *", key="apt_date")
                 with ac2:
-                    apt_time = st.selectbox("Time Slot", ["09:00", "09:30", "10:00", "10:30", "11:00", "11:30",
-                                                          "12:00", "14:00", "14:30", "15:00", "15:30", "16:00", "16:30"])
+                    apt_time = st.selectbox("Select Time Slot *",
+                                            ["09:00", "09:30", "10:00", "10:30", "11:00", "11:30",
+                                             "12:00", "14:00", "14:30", "15:00", "15:30", "16:00", "16:30"],
+                                            key="apt_time")
                 with ac3:
-                    apt_type = st.selectbox("Consultation Type", ["Online", "Offline"])
-                apt_notes = st.text_area("Notes for Doctor (optional)", placeholder="Describe your concern briefly...")
+                    apt_type = st.selectbox("Consultation Type *", ["Online", "Offline"], key="apt_type")
 
-                if st.form_submit_button("📅 Book Appointment", use_container_width=True):
-                    aid = create_appointment(user["patient_id"], selected_doc_id,
-                                             str(apt_date), apt_time, apt_type, apt_notes)
-                    st.success(f"✅ Appointment booked! ID: **{aid}** — Status: Pending")
-                    st.balloons()
+                st.markdown("<div style='height: 8px;'></div>", unsafe_allow_html=True)
+
+                # ━━━━ SECTION 3: Medical Information ━━━━
+                st.markdown("""
+                <div style='background: linear-gradient(135deg, #fce4ec22, #f8bbd022);
+                            padding: 12px 18px; border-radius: 10px; margin: 10px 0 15px 0;
+                            border-left: 4px solid #e91e63;'>
+                    <h4 style='margin: 0;'>🩺 Medical Information</h4>
+                </div>
+                """, unsafe_allow_html=True)
+
+                apt_symptoms = st.text_area("Symptoms / Description *",
+                                            placeholder="Describe your symptoms or reason for visit in detail...",
+                                            height=100, key="apt_symptoms")
+
+                apt_skin_image = st.file_uploader("Upload Skin Image (Optional)",
+                                                   type=["jpg", "jpeg", "png"],
+                                                   help="Upload a photo of the skin lesion or area of concern",
+                                                   key="apt_skin_img")
+
+                apt_medical_history = st.text_area("Previous Medical History (Optional)",
+                                                    placeholder="Any previous conditions, allergies, medications, or past treatments...",
+                                                    height=80, key="apt_med_history")
+
+                apt_notes = st.text_area("Additional Notes for Doctor (Optional)",
+                                         placeholder="Any other information you'd like the doctor to know...",
+                                         height=60, key="apt_notes")
+
+                st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
+
+                # ━━━━ ACTION BUTTONS ━━━━
+                btn_col1, btn_col2 = st.columns(2)
+                with btn_col1:
+                    submitted = st.form_submit_button("📅 Book Appointment", use_container_width=True,
+                                                       type="primary")
+                with btn_col2:
+                    reset_clicked = st.form_submit_button("🔄 Reset Form", use_container_width=True)
+
+                if submitted:
+                    # Validation
+                    if not apt_full_name.strip():
+                        st.error("❌ Please enter your full name.")
+                    elif not apt_symptoms.strip():
+                        st.error("❌ Please describe your symptoms or reason for visit.")
+                    else:
+                        # Process optional image
+                        img_blob = None
+                        if apt_skin_image is not None:
+                            img_blob = apt_skin_image.read()
+
+                        aid = create_appointment(
+                            patient_id=user["patient_id"],
+                            doctor_id=selected_doc_id,
+                            date=str(apt_date),
+                            time=apt_time,
+                            consultation_type=apt_type,
+                            notes=apt_notes,
+                            patient_name=apt_full_name.strip(),
+                            patient_age=apt_age,
+                            patient_gender=apt_gender,
+                            patient_phone=apt_phone.strip(),
+                            patient_email=apt_email.strip(),
+                            symptoms=apt_symptoms.strip(),
+                            medical_history=apt_medical_history.strip(),
+                            skin_image_blob=img_blob,
+                        )
+                        st.success(f"✅ Appointment booked successfully! ID: **{aid}** — Status: Pending")
+                        st.balloons()
+
+                if reset_clicked:
+                    st.rerun()
+
         else:
             st.info("No verified doctors available yet. Please check back later.")
 
@@ -3846,7 +4026,9 @@ if page == "📅 Appointments":
             # Tabs for status
             tab_all, tab_pending, tab_approved = st.tabs(["All", "Pending", "Approved"])
             with tab_all:
-                display_cols = ["appointment_id", "patient_name", "age", "gender", "date", "time", "status", "consultation_type", "notes"]
+                display_cols = ["appointment_id", "patient_name", "patient_age", "patient_gender",
+                                "patient_phone", "patient_email", "date", "time", "status",
+                                "consultation_type", "symptoms", "medical_history", "notes"]
                 avail = [c for c in display_cols if c in my_apts.columns]
                 st.dataframe(my_apts[avail], use_container_width=True)
             with tab_pending:
